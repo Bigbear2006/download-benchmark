@@ -2,19 +2,32 @@ import argparse
 import asyncio
 import sys
 import time
+from dataclasses import dataclass
 
 import aiohttp
 
 DEFAULT_REQUESTS = 10
-CHUNK_SIZE = 64 * 1024  # читаем тело кусками, чтобы не держать файл в памяти
-MB = 1_000_000  # 1 МБ = 10^6 байт
+CHUNK_SIZE = 64 * 1024
+MB = 1_000_000  # 1 Мегабайт
 
 
-async def fetch_once(session: aiohttp.ClientSession, url: str) -> tuple[int, float]:
-    """Выполняет один GET и возвращает (скачано_байт, затрачено_секунд).
+@dataclass
+class FetchResult:
+    size: int  # скачано байт
+    elapsed: float  # затрачено секунд
 
-    Время считается от отправки запроса до получения последнего байта тела.
-    """
+    @property
+    def speed(self) -> float:
+        return self.size / self.elapsed / MB
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.size / MB:8.2f} МБ за {self.elapsed:7.3f} с "
+            f"({self.speed:7.2f} МБ/с)"
+        )
+
+
+async def fetch(session: aiohttp.ClientSession, url: str) -> FetchResult:
     start = time.perf_counter()
     size = 0
     async with session.get(url) as response:
@@ -22,11 +35,10 @@ async def fetch_once(session: aiohttp.ClientSession, url: str) -> tuple[int, flo
         async for chunk in response.content.iter_chunked(CHUNK_SIZE):
             size += len(chunk)
     elapsed = time.perf_counter() - start
-    return size, elapsed
+    return FetchResult(size, elapsed)
 
 
-def describe_error(exc: Exception) -> str:
-    """Короткое человекочитаемое описание ошибки запроса."""
+def get_error_message(exc: Exception) -> str:
     if isinstance(exc, aiohttp.ClientResponseError):
         return f"HTTP {exc.status} {exc.message}"
     if isinstance(exc, asyncio.TimeoutError):
@@ -35,10 +47,7 @@ def describe_error(exc: Exception) -> str:
 
 
 async def run(url: str, count: int) -> int:
-    # total=None: тяжёлый файл может качаться долго, общий лимит не ставим,
-    # но зависшее соединение (нет данных 30 с) обрываем.
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=30)
-    # Просим сервер не сжимать ответ, чтобы объём был равен реально переданному.
     headers = {"Accept-Encoding": "identity"}
 
     durations: list[float] = []
@@ -48,26 +57,24 @@ async def run(url: str, count: int) -> int:
     print(f"URL: {url}")
     print(f"Запросов: {count} (последовательно)\n")
 
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout, headers=headers
+    ) as session:
         for i in range(1, count + 1):
             try:
-                size, elapsed = await fetch_once(session, url)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                result = await fetch(session, url)
+            except (TimeoutError, aiohttp.ClientError) as exc:
                 failed += 1
-                print(f"[{i:>2}/{count}] ошибка: {describe_error(exc)}")
+                print(f"[{i:>2}/{count}] ошибка: {get_error_message(exc)}")
                 continue
 
-            durations.append(elapsed)
-            total_bytes += size
-            speed = size / elapsed / MB
-            print(
-                f"[{i:>2}/{count}] {size / MB:8.2f} МБ за {elapsed:7.3f} с "
-                f"({speed:7.2f} МБ/с)"
-            )
+            durations.append(result.elapsed)
+            total_bytes += result.size
+            print(f"[{i:>2}/{count}] {result}")
 
     print()
     if not durations:
-        print("Ни один запрос не завершился успешно.")
+        print("\nНи один запрос не завершился успешно.")
         return 1
 
     total_time = sum(durations)
@@ -85,9 +92,11 @@ async def run(url: str, count: int) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Замер скорости скачивания по URL (aiohttp)."
+        description="Замер скорости скачивания по URL."
     )
-    parser.add_argument("url", help="адрес, к которому стучаться (http:// или https://)")
+    parser.add_argument(
+        "url", help="адрес, к которому стучаться (http:// или https://)"
+    )
     parser.add_argument(
         "-n",
         "--requests",
